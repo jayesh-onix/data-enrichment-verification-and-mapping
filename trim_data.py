@@ -9,8 +9,8 @@ output_file = "/home/jayesh/onix/internal_projects/data_enrichment_and_clubing/o
 # Load the dataset
 df = pd.read_csv(input_file)
 
-# Select first 5000 rows
-trimmed_df = df.head(3000)
+# Select first 60 rows
+trimmed_df = df.head(60)
 
 # Save the trimmed dataset
 trimmed_df.to_csv(output_file, index=False)

@@ -156,20 +156,39 @@ async def call_gemini_verify(
     client: genai.Client,
     prompt: str,
 ) -> dict[str, Any]:
-    config = types.GenerateContentConfig(
-        tools=[types.Tool(google_search=types.GoogleSearch())],
-        response_mime_type="application/json",
-        response_schema=VerificationResponse,
-        temperature=0,
-    )
-
-    response = await asyncio.to_thread(
+    # Pass 1: use Google Search grounding to gather evidence.
+    # NOTE: grounding and response_schema are mutually exclusive in the Gemini API.
+    grounding_response = await asyncio.to_thread(
         client.models.generate_content,
         model=MODEL_NAME,
         contents=prompt,
-        config=config,
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+            temperature=0,
+        ),
     )
-    return json.loads(response.text or "{}")
+    evidence = grounding_response.text or ""
+
+    # Pass 2: extract structured verdict from the grounded evidence.
+    # IMPORTANT: the original prompt (containing the company fields we are verifying)
+    # is included here so the model knows what exact values to compare against.
+    extraction_prompt = (
+        "You are a data quality auditor. Using the research evidence below, evaluate "
+        "each original company field and populate the JSON schema with your verdict.\n\n"
+        f"=== ORIGINAL FIELDS TO VERIFY ===\n{prompt}\n\n"
+        f"=== RESEARCH EVIDENCE FROM WEB ===\n{evidence}"
+    )
+    extraction_response = await asyncio.to_thread(
+        client.models.generate_content,
+        model=MODEL_NAME,
+        contents=extraction_prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=VerificationResponse,
+            temperature=0,
+        ),
+    )
+    return json.loads(extraction_response.text or "{}")
 
 
 @dataclass(frozen=True)
@@ -285,6 +304,37 @@ async def async_main() -> None:
     with args.input.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
+
+    if not rows:
+        raise SystemExit("Input file is empty.")
+
+    # Validate that all expected column names are present in the CSV.
+    # A mismatch here causes silent empty-string reads for every field.
+    actual_headers = set(rows[0].keys())
+    expected_headers = {
+        "Account ID 18 Digit",
+        "Account Name",
+        "Industry",
+        "Segment",
+        TARGETS.website_col,
+        TARGETS.description_col,
+        TARGETS.hq_state_col,
+        TARGETS.region_col,
+        TARGETS.annual_revenue_col,
+    }
+    missing_headers = expected_headers - actual_headers
+    if missing_headers:
+        logging.error(
+            "CSV is missing %d expected column(s): %s",
+            len(missing_headers),
+            sorted(missing_headers),
+        )
+        logging.error("Actual CSV columns: %s", sorted(actual_headers))
+        raise SystemExit(
+            "Aborting: column name mismatch. Fix the CSV headers or update "
+            "UnknownFixTargets in account_enrichment_common.py to match."
+        )
+    logging.info("Column validation passed. CSV has %d rows.", len(rows))
 
     population_size = len(rows)
     n = sample_size_for_proportion(
