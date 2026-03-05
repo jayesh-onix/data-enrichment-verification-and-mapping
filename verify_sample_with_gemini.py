@@ -151,15 +151,40 @@ Return ONLY valid JSON matching the schema.
 """
 
 
+def _extract_evidence_text(response: types.GenerateContentResponse) -> str:
+    """Extract text from a response and append grounding sources if available."""
+    try:
+        text = response.text or ""
+    except (ValueError, AttributeError):
+        # response.text raises ValueError when response is blocked by safety filters
+        text = ""
+
+    sources = []
+    if response.candidates and response.candidates[0].grounding_metadata:
+        gm = response.candidates[0].grounding_metadata
+        if gm.grounding_chunks:
+            for chunk in gm.grounding_chunks:
+                if chunk.web and chunk.web.uri:
+                    sources.append(chunk.web.uri)
+                    
+    if sources:
+        text += "\n\n=== GROUNDING SOURCES ===\n"
+        for i, source in enumerate(sources, 1):
+            text += f"[{i}] {source}\n"
+            
+    return text
+
+
 async def call_gemini_verify(
     *,
-    client: genai.Client,
+    async_client,
     prompt: str,
+    account_name: str = "",
 ) -> dict[str, Any]:
+    label = account_name or "unknown account"
     # Pass 1: use Google Search grounding to gather evidence.
     # NOTE: grounding and response_schema are mutually exclusive in the Gemini API.
-    grounding_response = await asyncio.to_thread(
-        client.models.generate_content,
+    grounding_response = await async_client.models.generate_content(
         model=MODEL_NAME,
         contents=prompt,
         config=types.GenerateContentConfig(
@@ -167,7 +192,10 @@ async def call_gemini_verify(
             temperature=0,
         ),
     )
-    evidence = grounding_response.text or ""
+    evidence = _extract_evidence_text(grounding_response)
+
+    if not evidence.strip():
+        logging.warning("Pass 1 (grounding) returned empty evidence for %s.", label)
 
     # Pass 2: extract structured verdict from the grounded evidence.
     # IMPORTANT: the original prompt (containing the company fields we are verifying)
@@ -178,8 +206,7 @@ async def call_gemini_verify(
         f"=== ORIGINAL FIELDS TO VERIFY ===\n{prompt}\n\n"
         f"=== RESEARCH EVIDENCE FROM WEB ===\n{evidence}"
     )
-    extraction_response = await asyncio.to_thread(
-        client.models.generate_content,
+    extraction_response = await async_client.models.generate_content(
         model=MODEL_NAME,
         contents=extraction_prompt,
         config=types.GenerateContentConfig(
@@ -188,7 +215,14 @@ async def call_gemini_verify(
             temperature=0,
         ),
     )
-    return json.loads(extraction_response.text or "{}")
+    try:
+        text = extraction_response.text or ""
+    except (ValueError, AttributeError):
+        text = ""
+    if not text.strip():
+        logging.warning("Pass 2 (extraction) returned empty response for %s.", label)
+        return {}
+    return json.loads(text)
 
 
 @dataclass(frozen=True)
@@ -217,15 +251,25 @@ async def verify_rows(
     max_concurrency: int,
 ) -> list[VerificationRowResult]:
     client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
+    async_client = client.aio
     semaphore = asyncio.Semaphore(max_concurrency)
+    completed = 0
+    total = len(rows)
 
     async def verify_one(row: dict[str, str]) -> VerificationRowResult:
-        prompt = build_verification_prompt(row)
-        async with semaphore:
-            verdict = await call_gemini_verify(client=client, prompt=prompt)
-
+        nonlocal completed
         account_id = normalize_whitespace(row.get("Account ID 18 Digit"))
         account_name = normalize_whitespace(row.get("Account Name"))
+        prompt = build_verification_prompt(row)
+        async with semaphore:
+            verdict = await call_gemini_verify(
+                async_client=async_client,
+                prompt=prompt,
+                account_name=account_name,
+            )
+        completed += 1
+        if completed % 10 == 0 or completed == total:
+            logging.info("Progress: %d/%d rows verified.", completed, total)
 
         return VerificationRowResult(
             account_id=account_id,
@@ -303,6 +347,15 @@ async def async_main() -> None:
 
     with args.input.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        if len(fieldnames) != len(set(fieldnames)):
+            seen: set[str] = set()
+            dupes = [h for h in fieldnames if h in seen or seen.add(h)]  # type: ignore[func-returns-value]
+            logging.warning(
+                "CSV has duplicate column headers: %s. "
+                "For each duplicate, the last column's value will be used.",
+                dupes,
+            )
         rows = list(reader)
 
     if not rows:
@@ -425,12 +478,33 @@ async def async_main() -> None:
         if not (r.website_correct and r.hq_state_correct and r.description_correct)
     )
     logging.info(
-        "✅ Verification complete in %.2fs. Report: %s. Failures (website+state+desc): %d/%d",
+        "Verification complete in %.2fs. Report: %s. Failures (website+state+desc): %d/%d",
         elapsed,
         args.output,
         failed,
         len(results),
     )
+
+    # Per-field accuracy breakdown
+    total_verified = len(results)
+    if total_verified > 0:
+        field_stats = [
+            ("website_correct", sum(1 for r in results if r.website_correct)),
+            ("hq_state_correct", sum(1 for r in results if r.hq_state_correct)),
+            ("description_correct", sum(1 for r in results if r.description_correct)),
+            ("region_correct", sum(1 for r in results if r.region_correct)),
+            ("industry_reasonable", sum(1 for r in results if r.industry_reasonable)),
+            ("annual_revenue_reasonable", sum(1 for r in results if r.annual_revenue_reasonable)),
+        ]
+        logging.info("Per-field accuracy breakdown:")
+        for field, correct_count in field_stats:
+            logging.info(
+                "  %-28s %d/%d (%.1f%%)",
+                field,
+                correct_count,
+                total_verified,
+                100 * correct_count / total_verified,
+            )
 
 
 def main() -> None:
