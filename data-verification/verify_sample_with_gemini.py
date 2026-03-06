@@ -42,9 +42,9 @@ from account_enrichment_common import (
 
 PROJECT_ID = "search-ahmed"
 LOCATION = "global"
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.1-pro-preview"
 
-DEFAULT_INPUT = Path("onix_enriched_data_trimmed.csv")
+DEFAULT_INPUT = Path("onix_enriched_data_trimmed_100.csv")
 DEFAULT_REPORT = Path("verification_sample_report.csv")
 
 TARGETS = UnknownFixTargets()
