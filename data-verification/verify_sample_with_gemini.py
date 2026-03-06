@@ -44,8 +44,16 @@ PROJECT_ID = "search-ahmed"
 LOCATION = "global"
 MODEL_NAME = "gemini-3.1-pro-preview"
 
-DEFAULT_INPUT = Path("onix_enriched_data_trimmed_100.csv")
-DEFAULT_REPORT = Path("verification_sample_report.csv")
+DEFAULT_INPUT = Path("data/filtered_data.csv")
+DEFAULT_REPORT = Path("data/verification_sample_report_all_false_data_check_2.csv")
+
+# Retry configuration for transient API errors (429 rate-limit / 5xx server errors).
+_MAX_RETRIES = 5
+_RETRY_BASE_DELAY = 8.0   # seconds; doubles on each attempt, capped at 120s
+
+# Maximum characters of grounding evidence forwarded to Pass 2.
+# Keeping this well under ~10k tokens prevents 400 INVALID_ARGUMENT failures.
+_MAX_EVIDENCE_CHARS = 10_000
 
 TARGETS = UnknownFixTargets()
 
@@ -144,7 +152,9 @@ Rules:
 1) Use Google Search grounding. Prefer official website and LinkedIn company page.
 2) Mark each field as correct/incorrect/reasonable using booleans in the JSON schema.
 3) If a field is incorrect, provide a corrected value (when possible).
-4) If uncertain, be conservative: set the boolean to false and explain why in notes.
+4) Only mark a field False if you have clear, contradicting web evidence. If evidence
+   is absent or ambiguous, mark the field True and add "could not confirm" in notes.
+   Do NOT penalise limited web presence or niche companies.
 5) Notes must be short and evidence-based; include sources if you can.
 
 Return ONLY valid JSON matching the schema.
@@ -166,13 +176,59 @@ def _extract_evidence_text(response: types.GenerateContentResponse) -> str:
             for chunk in gm.grounding_chunks:
                 if chunk.web and chunk.web.uri:
                     sources.append(chunk.web.uri)
-                    
+
     if sources:
         text += "\n\n=== GROUNDING SOURCES ===\n"
         for i, source in enumerate(sources, 1):
             text += f"[{i}] {source}\n"
-            
+
     return text
+
+
+def _truncate_evidence(evidence: str) -> str:
+    """Truncate grounding evidence to _MAX_EVIDENCE_CHARS to prevent Pass 2 token overflow."""
+    if len(evidence) <= _MAX_EVIDENCE_CHARS:
+        return evidence
+    return (
+        evidence[:_MAX_EVIDENCE_CHARS]
+        + f"\n\n[Evidence truncated at {_MAX_EVIDENCE_CHARS} chars to stay within token limits]"
+    )
+
+
+async def _call_with_retry(coro_fn, label: str) -> Any:
+    """
+    Execute an async coroutine factory with exponential-backoff retry.
+
+    Retries on:
+      - 429 RESOURCE_EXHAUSTED  (rate-limit)
+      - 500 / 503 UNAVAILABLE   (transient server errors)
+
+    Raises immediately on non-retryable errors such as
+      - 400 INVALID_ARGUMENT    (prompt too long even after truncation, bad request)
+    """
+    delay = _RETRY_BASE_DELAY
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            return await coro_fn()
+        except Exception as exc:
+            err_str = str(exc)
+            is_rate_limit = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
+            is_server_error = any(code in err_str for code in ("500", "503", "UNAVAILABLE", "INTERNAL"))
+            if (is_rate_limit or is_server_error) and attempt < _MAX_RETRIES:
+                jitter = random.uniform(0, delay * 0.25)
+                wait = delay + jitter
+                logging.warning(
+                    "Attempt %d/%d for '%s' hit retryable error (%s). Retrying in %.1fs...",
+                    attempt + 1,
+                    _MAX_RETRIES + 1,
+                    label,
+                    err_str[:120],
+                    wait,
+                )
+                await asyncio.sleep(wait)
+                delay = min(delay * 2, 120)
+                continue
+            raise
 
 
 async def call_gemini_verify(
@@ -182,38 +238,47 @@ async def call_gemini_verify(
     account_name: str = "",
 ) -> dict[str, Any]:
     label = account_name or "unknown account"
-    # Pass 1: use Google Search grounding to gather evidence.
+
+    # Pass 1: Google Search grounding to gather web evidence.
     # NOTE: grounding and response_schema are mutually exclusive in the Gemini API.
-    grounding_response = await async_client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            tools=[types.Tool(google_search=types.GoogleSearch())],
-            temperature=0,
+    grounding_response = await _call_with_retry(
+        lambda: async_client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                temperature=0,
+            ),
         ),
+        label=f"{label} (pass1)",
     )
     evidence = _extract_evidence_text(grounding_response)
 
     if not evidence.strip():
         logging.warning("Pass 1 (grounding) returned empty evidence for %s.", label)
 
+    # Truncate evidence before Pass 2 to prevent 400 INVALID_ARGUMENT token overflow.
+    evidence = _truncate_evidence(evidence)
+
     # Pass 2: extract structured verdict from the grounded evidence.
-    # IMPORTANT: the original prompt (containing the company fields we are verifying)
-    # is included here so the model knows what exact values to compare against.
+    # The original prompt (company fields) is included so the model knows what to compare.
     extraction_prompt = (
         "You are a data quality auditor. Using the research evidence below, evaluate "
         "each original company field and populate the JSON schema with your verdict.\n\n"
         f"=== ORIGINAL FIELDS TO VERIFY ===\n{prompt}\n\n"
         f"=== RESEARCH EVIDENCE FROM WEB ===\n{evidence}"
     )
-    extraction_response = await async_client.models.generate_content(
-        model=MODEL_NAME,
-        contents=extraction_prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=VerificationResponse,
-            temperature=0,
+    extraction_response = await _call_with_retry(
+        lambda: async_client.models.generate_content(
+            model=MODEL_NAME,
+            contents=extraction_prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=VerificationResponse,
+                temperature=0,
+            ),
         ),
+        label=f"{label} (pass2)",
     )
     try:
         text = extraction_response.text or ""
@@ -233,6 +298,8 @@ class VerificationRowResult:
     hq_state: str
     region: str
     description: str
+    # "verified" = Gemini completed the check; "api_error" = transient failure, result is unreliable.
+    verification_status: str
     website_correct: bool
     hq_state_correct: bool
     description_correct: bool
@@ -278,6 +345,7 @@ async def verify_rows(
             hq_state=normalize_whitespace(row.get(TARGETS.hq_state_col)),
             region=normalize_region(row.get(TARGETS.region_col)),
             description=normalize_whitespace(row.get(TARGETS.description_col)),
+            verification_status="verified",
             website_correct=bool(verdict.get("website_correct", False)),
             hq_state_correct=bool(verdict.get("hq_state_correct", False)),
             description_correct=bool(verdict.get("description_correct", False)),
@@ -296,6 +364,10 @@ async def verify_rows(
     finalized: list[VerificationRowResult] = []
     for row, result in zip(rows, results):
         if isinstance(result, Exception):
+            # Mark as api_error so downstream consumers can distinguish
+            # a transient API failure from an actual data quality failure.
+            # Boolean fields are left False but must NOT be interpreted as
+            # data-quality verdicts; check verification_status == "api_error" first.
             finalized.append(
                 VerificationRowResult(
                     account_id=normalize_whitespace(row.get("Account ID 18 Digit")),
@@ -304,6 +376,7 @@ async def verify_rows(
                     hq_state=normalize_whitespace(row.get(TARGETS.hq_state_col)),
                     region=normalize_region(row.get(TARGETS.region_col)),
                     description=normalize_whitespace(row.get(TARGETS.description_col)),
+                    verification_status="api_error",
                     website_correct=False,
                     hq_state_correct=False,
                     description_correct=False,
@@ -313,7 +386,7 @@ async def verify_rows(
                     corrected_website="",
                     corrected_hq_state="",
                     corrected_region="",
-                    notes=f"Verification failed with exception: {result}",
+                    notes=f"API error — result unreliable. Exception: {result}",
                 )
             )
         else:
@@ -329,7 +402,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--confidence", type=float, default=0.95, choices=[0.90, 0.95, 0.99])
     parser.add_argument("--margin-of-error", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--max-concurrency", type=int, default=5)
+    parser.add_argument("--max-concurrency", type=int, default=2)
     return parser.parse_args()
 
 
@@ -435,6 +508,7 @@ async def async_main() -> None:
         "HQ State",
         "Region",
         "Description",
+        "verification_status",
         "website_correct",
         "hq_state_correct",
         "description_correct",
@@ -459,6 +533,7 @@ async def async_main() -> None:
                     "HQ State": r.hq_state,
                     "Region": r.region,
                     "Description": r.description,
+                    "verification_status": r.verification_status,
                     "website_correct": r.website_correct,
                     "hq_state_correct": r.hq_state_correct,
                     "description_correct": r.description_correct,
@@ -472,31 +547,51 @@ async def async_main() -> None:
                 }
             )
 
+    verified_results = [r for r in results if r.verification_status == "verified"]
+    api_error_results = [r for r in results if r.verification_status == "api_error"]
+
     failed = sum(
         1
-        for r in results
+        for r in verified_results
         if not (r.website_correct and r.hq_state_correct and r.description_correct)
     )
     logging.info(
-        "Verification complete in %.2fs. Report: %s. Failures (website+state+desc): %d/%d",
+        "Verification complete in %.2fs. Report: %s.",
         elapsed,
         args.output,
-        failed,
+    )
+    logging.info(
+        "  Rows successfully verified : %d/%d",
+        len(verified_results),
         len(results),
     )
+    logging.info(
+        "  Rows failed due to API error: %d/%d  (NOT a data quality verdict — retry these)",
+        len(api_error_results),
+        len(results),
+    )
+    if api_error_results:
+        logging.info("  API-error accounts:")
+        for r in api_error_results:
+            logging.info("    - %s (%s)", r.account_name, r.account_id)
+    logging.info(
+        "  Data quality failures (website+state+desc) among verified rows: %d/%d",
+        failed,
+        len(verified_results),
+    )
 
-    # Per-field accuracy breakdown
-    total_verified = len(results)
+    # Per-field accuracy breakdown (verified rows only — api_error rows excluded)
+    total_verified = len(verified_results)
     if total_verified > 0:
         field_stats = [
-            ("website_correct", sum(1 for r in results if r.website_correct)),
-            ("hq_state_correct", sum(1 for r in results if r.hq_state_correct)),
-            ("description_correct", sum(1 for r in results if r.description_correct)),
-            ("region_correct", sum(1 for r in results if r.region_correct)),
-            ("industry_reasonable", sum(1 for r in results if r.industry_reasonable)),
-            ("annual_revenue_reasonable", sum(1 for r in results if r.annual_revenue_reasonable)),
+            ("website_correct", sum(1 for r in verified_results if r.website_correct)),
+            ("hq_state_correct", sum(1 for r in verified_results if r.hq_state_correct)),
+            ("description_correct", sum(1 for r in verified_results if r.description_correct)),
+            ("region_correct", sum(1 for r in verified_results if r.region_correct)),
+            ("industry_reasonable", sum(1 for r in verified_results if r.industry_reasonable)),
+            ("annual_revenue_reasonable", sum(1 for r in verified_results if r.annual_revenue_reasonable)),
         ]
-        logging.info("Per-field accuracy breakdown:")
+        logging.info("Per-field accuracy (verified rows only):")
         for field, correct_count in field_stats:
             logging.info(
                 "  %-28s %d/%d (%.1f%%)",
