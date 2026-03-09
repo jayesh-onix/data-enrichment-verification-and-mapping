@@ -1,23 +1,27 @@
 """
 Unified Master Enrichment & Intelligence Script v2
-Production-Ready | 40k+ Rows | Two-Pass Pipeline
+Production-Ready | 40k+ Rows | Single-Pass Pipeline
 
-Improvements over v1:
-  Phase 1 – Critical Bug Fixes
-    • Global semaphore (one shared instance, not per-task)
-    • Retry queue with exponential back-off for 429 / transient errors
-    • Header written reliably (seek-to-start / empty-file check, not post-open stat)
+Architecture:
+  Single API call per company using gemini-3.1-pro-preview with
+  Google Search grounding + controlled generation (response_schema).
 
-  Phase 2 – Data Accuracy
-    • "NOT FOUND" enforcement in prompts – no hallucination guesses
-    • Two-pass pipeline: Flash (fast firmographics) + Pro (grounded intelligence)
-    • Robust JSON parsing – strips markdown fences, catches JSONDecodeError
+  Why single-pass?
+    • gemini-2.5-flash does NOT support response_schema + Google Search
+      together on Vertex AI (returns 400 INVALID_ARGUMENT).
+    • A two-pass Flash (no search) + Pro approach causes two problems:
+        1. Pass-1 validates website / firmographics WITHOUT real search — unreliable.
+        2. Pass-1’s unverified output biases Pass-2 when passed as “known context”.
+    • A single Pro + Search call grounds EVERY field in real web data,
+      eliminates the bias chain, and halves the total API calls (40k vs 80k).
 
-  Phase 3 – Performance
-    • MAX_CONCURRENCY raised to 30 (tune to your quota)
-    • Static batch sleep removed; rate-limit back-off via retry queue
+  Operational features:
+    • Global semaphore for quota-safe concurrency
+    • Retry with exponential back-off + Retry-After header support for 429 / 5xx
     • In-memory company cache to skip duplicate API calls
+    • Resume support: skips already-enriched rows on restart
     • Per-call asyncio timeout (120 s) to prevent hung tasks
+    • Streaming CSV writes with flush after each batch
 """
 
 from __future__ import annotations
@@ -46,25 +50,17 @@ from pydantic import BaseModel, Field
 PROJECT_ID = "search-ahmed"       # GCP project
 LOCATION = "global"                   # Vertex AI location
 
-# Pass-1: fast model for verifiable firmographics
-MODEL_FLASH = "gemini-2.5-flash"
-
-# Pass-2: grounded reasoning model for sales intelligence
-MODEL_PRO = "gemini-3.1-pro-preview"
+# Single model: Pro with Google Search + controlled generation
+MODEL_NAME = "gemini-3.1-pro-preview"
 
 INPUT_FILE = Path("data/test_final_10.csv")
-OUTPUT_REPORT = Path("data/test_final_10_output_v6.csv")
+OUTPUT_REPORT = Path("data/test_final_10_output_v8.csv")
 
-# Concurrency – separate semaphores per model (tune to your GCP project quota).
-# Flash (Pass-1) supports higher QPM; Pro (Pass-2) has lower limits.
-# Rule of thumb: QPM_limit / avg_seconds_per_call.
-# Example: Flash 60 QPM / 4s ≈ 15 slots; Pro 10 QPM / 10s ≈ 5 slots.
-FLASH_CONCURRENCY = 15   # Concurrent Pass-1 (gemini-2.5-flash) calls
-PRO_CONCURRENCY   = 5    # Concurrent Pass-2 (gemini-3.1-pro-preview) calls
+# Concurrency – one global semaphore (tune to your GCP project’s Pro QPM quota)
+MAX_CONCURRENCY = 30
 
 # How many asyncio tasks to pre-spawn into the pending queue.
-# Must be ≥ FLASH_CONCURRENCY to keep Flash fully utilised.
-INITIAL_QUEUE_DEPTH = FLASH_CONCURRENCY * 4   # 60 tasks; memory-cheap
+INITIAL_QUEUE_DEPTH = MAX_CONCURRENCY * 2
 
 # Retry settings for 429 / 5xx errors
 MAX_RETRIES = 5
@@ -77,11 +73,26 @@ API_TIMEOUT_S  = 120.0       # asyncio.wait_for timeout (seconds)
 API_TIMEOUT_MS = 110_000     # httpx-layer fallback timeout (milliseconds, slightly less than above)
 
 # ---------------------------------------------------------------------------
-# OUTPUT SCHEMA – Pydantic models for structured responses
+# OUTPUT SCHEMA – Unified Pydantic model for structured response
 # ---------------------------------------------------------------------------
 
-class FirmographicsData(BaseModel):
-    """Pass-1: Basic, verifiable firmographic facts only."""
+class AccountEnrichment(BaseModel):
+    """Unified schema: website validation + firmographics + sales intelligence."""
+    # Website validation & account name
+    website: str = Field(
+        description=(
+            "Verified official website URL for this company. "
+            "Return 'NOT FOUND' if unverifiable."
+        )
+    )
+    correct_account_name: str = Field(
+        description=(
+            "The correct official company name as found on the verified website. "
+            "If the provided website was invalid, write the correct company name. "
+            "If valid, keep the original account name unchanged."
+        )
+    )
+    # Firmographics
     headcount: str = Field(
         description=(
             "Current employee count range (e.g. '5,000–10,000'). "
@@ -108,8 +119,8 @@ class FirmographicsData(BaseModel):
     )
     region: str = Field(
         description=(
-            "US Region. Use ONLY: 'US east', 'US west', 'US north', 'US south', or 'US central'. "
-            "Return 'NOT FOUND' if non-US or unverifiable."
+            "US Region. Use ONLY: 'US East', 'US West', 'US North', 'US South', or 'US Central'. "
+            "Return 'NOT FOUND' if the company is non-US or sub-region is unclear."
         )
     )
     geo: str = Field(
@@ -124,26 +135,7 @@ class FirmographicsData(BaseModel):
             "Return 'NOT FOUND' if no reliable information exists."
         )
     )
-    website: str = Field(
-        description=(
-            "Verified official website URL. "
-            "Return 'NOT FOUND' if unverifiable."
-        )
-    )
-    correct_account_name: str = Field(
-        description=(
-            "The correct official account name based on the verified website. "
-            "If the provided website was invalid, write the correct account name here. "
-            "If valid, keep the original account name."
-        )
-    )
-    confidence: float = Field(
-        description="Confidence in the above data (0.0 to 1.0)."
-    )
-
-
-class SalesIntelligenceData(BaseModel):
-    """Pass-2: Deep sales intelligence requiring search-grounded reasoning."""
+    # Sales intelligence
     cloud_stack: str = Field(
         description=(
             "Current cloud usage (AWS / Azure / GCP) and Workspace or M365 footprint. "
@@ -179,7 +171,7 @@ class SalesIntelligenceData(BaseModel):
         description="Key URLs used for verification (LinkedIn, Wikipedia, news articles)."
     )
     confidence: float = Field(
-        description="Confidence in the above intelligence (0.0 to 1.0)."
+        description="Overall confidence in the enrichment data (0.0 to 1.0)."
     )
 
 
@@ -189,14 +181,15 @@ class SalesIntelligenceData(BaseModel):
 
 FIELDNAMES = [
     "account_id", "account_name",
-    # Pass-1 fields
-    "website", "Correct_Account_Name", "headcount", "annual_revenue", "industry",
+    # Website validation
+    "website", "Correct_Account_Name",
+    # Firmographics
+    "headcount", "annual_revenue", "industry",
     "hq_location", "region", "geo", "description",
-    "firmographics_confidence",
-    # Pass-2 fields
+    # Sales intelligence
     "cloud_stack", "legacy_debt", "strategic_priorities_2026",
     "business_triggers", "sales_hook_2026",
-    "sources", "intelligence_confidence",
+    "sources", "confidence",
     # Metadata
     "enrichment_status", "enriched_at",
 ]
@@ -307,108 +300,70 @@ async def _call_with_retry(
 
 
 # ---------------------------------------------------------------------------
-# API CALLS
+# API CALL
 # ---------------------------------------------------------------------------
 
 _HTTP_OPTIONS = types.HttpOptions(timeout=API_TIMEOUT_MS)
 
 
-async def _pass1_firmographics(
+async def _enrich_account(
     aio_client,
     name: str,
     url: str,
-    flash_semaphore: asyncio.Semaphore,
+    semaphore: asyncio.Semaphore,
     label: str,
 ) -> dict[str, Any] | None:
-    """Call 1 – Flash model: extract fast, verifiable firmographics."""
+    """Single Pro call with Google Search + controlled generation.
+
+    A holistic prompt lets the model research everything in one search session.
+    Website validation, firmographics, and sales intelligence are all
+    grounded in real web data — no blind guesses.
+    """
     prompt = (
-        f"You are a meticulous data researcher.\n"
+        f"You are a Senior Sales Intelligence Analyst for Google Cloud.\n"
         f"Company: {name!r}\n"
         f"Provided URL: {url!r}\n\n"
         f"STEP 1 – WEBSITE VALIDATION (do this first):\n"
-        f"  Determine whether the Provided URL is the real, official website for '{name}'.\n"
-        f"  • If the URL is valid and belongs to this company:\n"
-        f"      – Set 'website' to the provided URL.\n"
-        f"      – Set 'correct_account_name' to the original account name (unchanged).\n"
-        f"  • If the URL is invalid, incorrect, or belongs to a different entity:\n"
-        f"      – Set 'website' to the correct verified official URL.\n"
-        f"      – Set 'correct_account_name' to the correct official company name.\n"
-        f"  • If you cannot verify any website for this company: set both 'website' and\n"
-        f"    'correct_account_name' to 'NOT FOUND'.\n\n"
+        f"  Use Google Search to determine whether the Provided URL is the real,\n"
+        f"  official website for '{name}'.\n"
+        f"  • If valid: set 'website' to the provided URL, set 'correct_account_name'\n"
+        f"    to the original account name (unchanged).\n"
+        f"  • If invalid or belongs to a different entity: set 'website' to the correct\n"
+        f"    verified official URL, set 'correct_account_name' to the correct official\n"
+        f"    company name.\n"
+        f"  • If unverifiable: set both to 'NOT FOUND'.\n\n"
         f"STEP 2 – FIRMOGRAPHIC DATA:\n"
-        f"  Extract ONLY verifiable facts from reliable public sources (Wikipedia, official\n"
-        f"  investor-relations pages, LinkedIn, Crunchbase, Bloomberg) for all remaining fields.\n\n"
+        f"  Extract verifiable facts from public sources (Wikipedia, official IR pages,\n"
+        f"  LinkedIn, Crunchbase, Bloomberg). Use the most recent data (prefer 2024–2026).\n\n"
+        f"STEP 3 – SALES INTELLIGENCE:\n"
+        f"  Research the CURRENT tech stack, strategic priorities, business triggers,\n"
+        f"  and create a specific sales hook for a Google Cloud AE in 2026.\n\n"
         f"FIELD CONSTRAINTS:\n"
         f"  'region'  – US-headquartered companies ONLY. Choose EXACTLY one of:\n"
         f"              'US East', 'US West', 'US North', 'US South', 'US Central'.\n"
-        f"              Return 'NOT FOUND' if the company is non-US or sub-region is unclear.\n"
+        f"              Return 'NOT FOUND' if non-US or sub-region is unclear.\n"
         f"  'geo'     – Choose EXACTLY one of: 'NA', 'LATAM', 'EMEA', 'APAC', 'ROW'.\n"
-        f"              This must always be populated if the company's country is known.\n"
+        f"              Must always be populated if the company's country is known.\n"
         f"  All other fields: return exactly 'NOT FOUND' if not verifiable — no guesses.\n"
-        f"  Use the most recent publicly available data (prefer 2024–2026).\n\n"
+        f"  Include source URLs in the 'sources' field.\n"
+        f"  The sales_hook_2026 must be grounded in a specific, real signal — not generic.\n\n"
         f"Return ONLY valid JSON matching the required schema."
     )
 
     def factory():
         return aio_client.models.generate_content(
-            model=MODEL_FLASH,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                http_options=_HTTP_OPTIONS,
-                response_mime_type="application/json",
-                response_schema=FirmographicsData,
-                temperature=0,
-            ),
-        )
-
-    return await _call_with_retry(factory, label, flash_semaphore)
-
-
-async def _pass2_intelligence(
-    aio_client,
-    name: str,
-    url: str,
-    firmographics: dict[str, Any],
-    pro_semaphore: asyncio.Semaphore,
-    label: str,
-) -> dict[str, Any] | None:
-    """Call 2 – Pro model with Google Search: deep sales intelligence."""
-    firm_summary = (
-        f"Industry: {firmographics.get('industry', 'Unknown')}, "
-        f"Headcount: {firmographics.get('headcount', 'Unknown')}, "
-        f"Revenue: {firmographics.get('annual_revenue', 'Unknown')}, "
-        f"HQ: {firmographics.get('hq_location', 'Unknown')}"
-    )
-    prompt = (
-        f"You are a Senior Sales Intelligence Analyst for Google Cloud in 2026.\n"
-        f"Company: {name} (URL: {url})\n"
-        f"Known firmographics: {firm_summary}\n\n"
-        f"Task: Using Google Search, research the CURRENT tech stack, strategic priorities, "
-        f"business triggers, and sales hooks for this company.\n\n"
-        f"CRITICAL RULES:\n"
-        f"  - Only report signals you can find from real, verifiable sources (news, filings, "
-        f"press releases, LinkedIn, Wikipedia).\n"
-        f"  - If a field cannot be determined from real sources, return exactly 'NOT FOUND'.\n"
-        f"  - Do NOT fabricate company plans, leadership changes, or tech stack details.\n"
-        f"  - Include source URLs in the 'sources' field.\n"
-        f"  - The sales_hook_2026 must be grounded in a specific, real signal — not generic.\n"
-        f"Return ONLY valid JSON matching the required schema."
-    )
-
-    def factory():
-        return aio_client.models.generate_content(
-            model=MODEL_PRO,
+            model=MODEL_NAME,
             contents=prompt,
             config=types.GenerateContentConfig(
                 http_options=_HTTP_OPTIONS,
                 tools=[types.Tool(google_search=types.GoogleSearch())],
                 response_mime_type="application/json",
-                response_schema=SalesIntelligenceData,
+                response_schema=AccountEnrichment,
                 temperature=0,
             ),
         )
 
-    return await _call_with_retry(factory, label, pro_semaphore)
+    return await _call_with_retry(factory, label, semaphore)
 
 
 # ---------------------------------------------------------------------------
@@ -418,82 +373,70 @@ async def _pass2_intelligence(
 async def enrich_row(
     aio_client,
     row: dict[str, str],
-    flash_semaphore: asyncio.Semaphore,
-    pro_semaphore: asyncio.Semaphore,
+    semaphore: asyncio.Semaphore,
     company_cache: dict[str, asyncio.Future],
 ) -> dict[str, Any]:
-    """Enrich a single CSV row using the two-pass pipeline."""
+    """Enrich a single CSV row using a single Pro + Search API call."""
     account_id = row.get("account_id", "")
     name = row.get("account_name", "").strip()
     url = row.get("website", "").strip()
     label = f"{name}|{account_id}"
 
     # --- Duplicate company cache ---
-    # Use account_id as tiebreaker for blank names to prevent cross-row cache collision.
     cache_key = name.lower() if name else f"__no_name__|{account_id}"
     if cache_key in company_cache:
         fut = company_cache[cache_key]
-        # Capture done-state BEFORE awaiting; after await it is always True.
         was_already_done = fut.done()
         if not was_already_done:
             logging.info("[%s] Cache dedup — waiting for concurrent enrichment to complete.", label)
         try:
-            firm_data, intel_data = await fut
+            data = await fut
             if was_already_done:
                 logging.info("[%s] Cache hit — reusing previous result.", label)
             else:
                 logging.info("[%s] Cache dedup — enrichment complete, result shared.", label)
         except Exception:
             logging.error("[%s] Cached enrichment failed; row will output NOT FOUND.", label)
-            firm_data, intel_data = None, None
+            data = None
     else:
         fut = asyncio.Future()
         company_cache[cache_key] = fut
-        firm_data, intel_data = None, None
+        data = None
         try:
-            # Pass 1 – Firmographics
-            firm_data = await _pass1_firmographics(
-                aio_client, name, url, flash_semaphore, label + "|pass1"
-            )
-
-            # Pass 2 – Intelligence (uses empty dict as fallback if pass-1 failed)
-            intel_data = await _pass2_intelligence(
-                aio_client, name, url, firm_data or {}, pro_semaphore, label + "|pass2"
-            )
+            data = await _enrich_account(aio_client, name, url, semaphore, label)
         except Exception as e:
             logging.error("[%s] Unexpected enrichment error: %s", label, e, exc_info=True)
         finally:
-            # Guarantee the future always resolves — even on double-fault —
-            # so dedup waiters are never permanently blocked.
+            # Guarantee the future always resolves so dedup waiters are never blocked.
             if not fut.done():
-                fut.set_result((firm_data, intel_data))
+                fut.set_result(data)
 
     # --- Build output row ---
-    enrichment_ok = bool(firm_data or intel_data)
+    d = data or {}
     return {
         "account_id": account_id,
         "account_name": name,
-        # Pass-1
-        "website": (firm_data or {}).get("website") or url or "NOT FOUND",
-        "Correct_Account_Name": (firm_data or {}).get("correct_account_name") or name or "NOT FOUND",
-        "headcount": (firm_data or {}).get("headcount", "NOT FOUND"),
-        "annual_revenue": (firm_data or {}).get("annual_revenue", "NOT FOUND"),
-        "industry": (firm_data or {}).get("industry", "NOT FOUND"),
-        "hq_location": (firm_data or {}).get("hq_location", "NOT FOUND"),
-        "region": (firm_data or {}).get("region", "NOT FOUND"),
-        "geo": (firm_data or {}).get("geo", "NOT FOUND"),
-        "description": (firm_data or {}).get("description", "NOT FOUND"),
-        "firmographics_confidence": (firm_data or {}).get("confidence", 0.0),
-        # Pass-2
-        "cloud_stack": (intel_data or {}).get("cloud_stack", "NOT FOUND"),
-        "legacy_debt": (intel_data or {}).get("legacy_debt", "NOT FOUND"),
-        "strategic_priorities_2026": (intel_data or {}).get("strategic_priorities_2026", "NOT FOUND"),
-        "business_triggers": (intel_data or {}).get("business_triggers", "NOT FOUND"),
-        "sales_hook_2026": (intel_data or {}).get("sales_hook_2026", "NOT FOUND"),
-        "sources": (intel_data or {}).get("sources", "NOT FOUND"),
-        "intelligence_confidence": (intel_data or {}).get("confidence", 0.0),
+        # Website validation
+        "website": d.get("website") or url or "NOT FOUND",
+        "Correct_Account_Name": d.get("correct_account_name") or name or "NOT FOUND",
+        # Firmographics
+        "headcount": d.get("headcount", "NOT FOUND"),
+        "annual_revenue": d.get("annual_revenue", "NOT FOUND"),
+        "industry": d.get("industry", "NOT FOUND"),
+        "hq_location": d.get("hq_location", "NOT FOUND"),
+        "region": d.get("region", "NOT FOUND"),
+        "geo": d.get("geo", "NOT FOUND"),
+        "description": d.get("description", "NOT FOUND"),
+        # Sales intelligence
+        "cloud_stack": d.get("cloud_stack", "NOT FOUND"),
+        "legacy_debt": d.get("legacy_debt", "NOT FOUND"),
+        "strategic_priorities_2026": d.get("strategic_priorities_2026", "NOT FOUND"),
+        "business_triggers": d.get("business_triggers", "NOT FOUND"),
+        "sales_hook_2026": d.get("sales_hook_2026", "NOT FOUND"),
+        "sources": d.get("sources", "NOT FOUND"),
+        "confidence": d.get("confidence", 0.0),
         # Metadata
-        "enrichment_status": "success" if enrichment_ok else "failed",
+        "enrichment_status": "success" if data else "failed",
         "enriched_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
 
@@ -555,9 +498,8 @@ async def async_main() -> None:
     logging.info("Rows to enrich: %d", total)
 
     # --- Shared state ---
-    flash_semaphore = asyncio.Semaphore(FLASH_CONCURRENCY)  # Pass-1 (Flash) gate
-    pro_semaphore   = asyncio.Semaphore(PRO_CONCURRENCY)    # Pass-2 (Pro)   gate
-    company_cache: dict[str, asyncio.Future] = {}           # dedup by company name
+    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)       # ONE global semaphore
+    company_cache: dict[str, asyncio.Future] = {}        # dedup by company name
 
     # --- Vertex AI client ---
     client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
@@ -581,14 +523,11 @@ async def async_main() -> None:
         processed_so_far = 0
 
         try:
-            # Pre-fill the pending queue to keep the pipeline saturated.
-            # INITIAL_QUEUE_DEPTH >> FLASH_CONCURRENCY ensures Flash never idles
-            # while waiting for new tasks to be spawned.
             for _ in range(INITIAL_QUEUE_DEPTH):
                 try:
                     row = next(row_iter)
                     task = asyncio.create_task(
-                        enrich_row(client.aio, row, flash_semaphore, pro_semaphore, company_cache)
+                        enrich_row(client.aio, row, semaphore, company_cache)
                     )
                     pending.add(task)
                 except StopIteration:
@@ -615,7 +554,7 @@ async def async_main() -> None:
                     try:
                         row = next(row_iter)
                         new_task = asyncio.create_task(
-                            enrich_row(client.aio, row, flash_semaphore, pro_semaphore, company_cache)
+                            enrich_row(client.aio, row, semaphore, company_cache)
                         )
                         pending.add(new_task)
                     except StopIteration:
