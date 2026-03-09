@@ -17,10 +17,10 @@ Architecture:
 
   Operational features:
     • Global semaphore for quota-safe concurrency
-    • Retry with exponential back-off + Retry-After header support for 429 / 5xx
+    • Retry with exponential back-off + Retry-After header for 429 / 499 / 5xx
     • In-memory company cache to skip duplicate API calls
     • Resume support: skips already-enriched rows on restart
-    • Per-call asyncio timeout (120 s) to prevent hung tasks
+    • Per-call asyncio timeout (180 s) to accommodate long search-grounded calls
     • Streaming CSV writes with flush after each batch
 """
 
@@ -54,7 +54,7 @@ LOCATION = "global"                   # Vertex AI location
 MODEL_NAME = "gemini-3.1-pro-preview"
 
 INPUT_FILE = Path("data/test_final_10.csv")
-OUTPUT_REPORT = Path("data/test_final_10_output_v8.csv")
+OUTPUT_REPORT = Path("data/test_final_10_output_v10.csv")
 
 # Concurrency – one global semaphore (tune to your GCP project’s Pro QPM quota)
 MAX_CONCURRENCY = 30
@@ -69,8 +69,11 @@ RETRY_MAX_DELAY = 120.0      # seconds
 RETRY_EXP_BASE = 2.0
 
 # Per-call API timeout
-API_TIMEOUT_S  = 120.0       # asyncio.wait_for timeout (seconds)
-API_TIMEOUT_MS = 110_000     # httpx-layer fallback timeout (milliseconds, slightly less than above)
+# Pro + Google Search with AFC can legitimately take 60–90s for complex
+# companies (multiple search rounds).  Set generous timeouts so the client
+# does NOT cancel in-flight requests (which causes 499 CANCELLED errors).
+API_TIMEOUT_S  = 180.0       # asyncio.wait_for timeout (seconds)
+API_TIMEOUT_MS = 170_000     # httpx-layer fallback timeout (milliseconds, slightly less)
 
 # ---------------------------------------------------------------------------
 # OUTPUT SCHEMA – Unified Pydantic model for structured response
@@ -223,34 +226,28 @@ async def _call_with_retry(
 ) -> dict[str, Any] | None:
     """
     Execute `coro_factory()` under the global semaphore.
-    Retries on 429 (rate limit) and 5xx (transient server errors) with
+    Retries on 429, 499, 5xx, and transient timeout errors with
     exponential back-off + full jitter.  Returns None after all attempts fail.
 
     Key design: the semaphore is RELEASED before any sleep so that other
     tasks are not starved while this one waits out a rate-limit or backoff.
-    asyncio.wait_for() is used to guarantee a real asyncio.TimeoutError is
-    raised (httpx timeouts raise httpx exceptions, not asyncio.TimeoutError).
     """
     delay = RETRY_INITIAL_DELAY
     for attempt in range(1, MAX_RETRIES + 1):
-        # wait_after is set to a positive number only when we should retry.
-        # It is checked OUTSIDE the semaphore so the slot is not held during sleep.
         wait_after: float | None = None
 
         async with semaphore:
             try:
-                # asyncio.wait_for raises asyncio.TimeoutError on expiry,
-                # regardless of what the underlying httpx client would raise.
                 response = await asyncio.wait_for(
                     coro_factory(), timeout=API_TIMEOUT_S
                 )
                 return _safe_json(response.text or "")
             except ClientError as exc:
-                if exc.code == 429:
-                    # Honour the Retry-After header when the API provides one;
-                    # it's more accurate than our local exponential back-off guess.
+                if exc.code in (429, 499):
+                    # 429 = rate-limited; 499 = the server or our asyncio.wait_for
+                    # cancelled the request (Client Closed Request).  Both are transient.
                     retry_after_hdr: str | None = None
-                    if exc.response is not None and isinstance(
+                    if exc.code == 429 and exc.response is not None and isinstance(
                         exc.response, httpx.Response
                     ):
                         retry_after_hdr = exc.response.headers.get("retry-after")
@@ -264,8 +261,10 @@ async def _call_with_retry(
                         jitter = random.uniform(0, delay)
                         wait_after = min(delay + jitter, RETRY_MAX_DELAY)
                     logging.warning(
-                        "[%s] Rate-limited (attempt %d/%d). Waiting %.1fs …%s",
-                        label, attempt, MAX_RETRIES, wait_after,
+                        "[%s] %s (attempt %d/%d). Waiting %.1fs …%s",
+                        label,
+                        "Rate-limited" if exc.code == 429 else "Request cancelled (499)",
+                        attempt, MAX_RETRIES, wait_after,
                         " (from Retry-After header)" if retry_after_hdr else "",
                     )
                     delay = min(delay * RETRY_EXP_BASE, RETRY_MAX_DELAY)
@@ -280,18 +279,18 @@ async def _call_with_retry(
                     label, exc.code, attempt, MAX_RETRIES, wait_after,
                 )
                 delay = min(delay * RETRY_EXP_BASE, RETRY_MAX_DELAY)
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
                 wait_after = min(delay, RETRY_MAX_DELAY)
-                logging.error(
-                    "[%s] API call timed out (attempt %d/%d). Waiting %.1fs …",
-                    label, attempt, MAX_RETRIES, wait_after,
+                logging.warning(
+                    "[%s] Timeout (%s, attempt %d/%d). Waiting %.1fs …",
+                    label, type(exc).__name__, attempt, MAX_RETRIES, wait_after,
                 )
                 delay = min(delay * RETRY_EXP_BASE, RETRY_MAX_DELAY)
             except Exception as exc:
                 logging.error("[%s] Unexpected error: %s", label, exc, exc_info=True)
                 return None
 
-        # Semaphore released — now safe to sleep without blocking other tasks.
+        # Semaphore released — sleep without blocking other tasks.
         if wait_after is not None:
             await asyncio.sleep(wait_after)
 
@@ -451,6 +450,10 @@ async def async_main() -> None:
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
+    # Suppress noisy per-request HTTP and AFC logs from the genai SDK.
+    # Our own retry/progress logging provides all needed operational visibility.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("google.genai").setLevel(logging.WARNING)
 
     # --- Input validation ---
     if not INPUT_FILE.exists():
