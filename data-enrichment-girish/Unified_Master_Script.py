@@ -17,12 +17,12 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 # --- CONFIGURATION ---
-PROJECT_ID = "sales-excellence"
+PROJECT_ID = "search-ahmed"  # GCP project for Vertex AI access
 LOCATION = "global"
 MODEL_NAME = "gemini-3.1-pro-preview"
 
-INPUT_FILE = Path("Google_Data_Enriching_first_lot_-_Sheet1.csv")
-OUTPUT_REPORT = Path("Final_Master_Intelligence_Report.csv")
+INPUT_FILE = Path("data/test_final_10.csv")
+OUTPUT_REPORT = Path("data/test_final_10_output_v1.csv")
 
 # Performance Settings (Adjust to your Quota)
 MAX_CONCURRENCY = 5 
