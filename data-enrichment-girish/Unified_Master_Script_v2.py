@@ -33,6 +33,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
 from google import genai
 from google.genai import types
 from google.genai.errors import ClientError, ServerError
@@ -52,10 +53,18 @@ MODEL_FLASH = "gemini-2.5-flash"
 MODEL_PRO = "gemini-3.1-pro-preview"
 
 INPUT_FILE = Path("data/test_final_10.csv")
-OUTPUT_REPORT = Path("data/test_final_10_output.csv")
+OUTPUT_REPORT = Path("data/test_final_10_output_v6.csv")
 
-# Concurrency – one global semaphore shared by ALL tasks
-MAX_CONCURRENCY = 30
+# Concurrency – separate semaphores per model (tune to your GCP project quota).
+# Flash (Pass-1) supports higher QPM; Pro (Pass-2) has lower limits.
+# Rule of thumb: QPM_limit / avg_seconds_per_call.
+# Example: Flash 60 QPM / 4s ≈ 15 slots; Pro 10 QPM / 10s ≈ 5 slots.
+FLASH_CONCURRENCY = 15   # Concurrent Pass-1 (gemini-2.5-flash) calls
+PRO_CONCURRENCY   = 5    # Concurrent Pass-2 (gemini-3.1-pro-preview) calls
+
+# How many asyncio tasks to pre-spawn into the pending queue.
+# Must be ≥ FLASH_CONCURRENCY to keep Flash fully utilised.
+INITIAL_QUEUE_DEPTH = FLASH_CONCURRENCY * 4   # 60 tasks; memory-cheap
 
 # Retry settings for 429 / 5xx errors
 MAX_RETRIES = 5
@@ -97,10 +106,16 @@ class FirmographicsData(BaseModel):
             "Return 'NOT FOUND' if not verifiable."
         )
     )
-    region_geo: str = Field(
+    region: str = Field(
         description=(
-            "US Region (e.g. 'Southeast') and Global GEO (e.g. 'NA'). "
-            "Return 'NOT FOUND' if not verifiable."
+            "US Region. Use ONLY: 'US east', 'US west', 'US north', 'US south', or 'US central'. "
+            "Return 'NOT FOUND' if non-US or unverifiable."
+        )
+    )
+    geo: str = Field(
+        description=(
+            "Global Geography. Use ONLY: 'NA', 'LATAM', 'EMEA', 'APAC', or 'ROW'. "
+            "Return 'NOT FOUND' if unverifiable."
         )
     )
     description: str = Field(
@@ -113,6 +128,13 @@ class FirmographicsData(BaseModel):
         description=(
             "Verified official website URL. "
             "Return 'NOT FOUND' if unverifiable."
+        )
+    )
+    correct_account_name: str = Field(
+        description=(
+            "The correct official account name based on the verified website. "
+            "If the provided website was invalid, write the correct account name here. "
+            "If valid, keep the original account name."
         )
     )
     confidence: float = Field(
@@ -168,8 +190,8 @@ class SalesIntelligenceData(BaseModel):
 FIELDNAMES = [
     "account_id", "account_name",
     # Pass-1 fields
-    "website", "headcount", "annual_revenue", "industry",
-    "hq_location", "region_geo", "description",
+    "website", "Correct_Account_Name", "headcount", "annual_revenue", "industry",
+    "hq_location", "region", "geo", "description",
     "firmographics_confidence",
     # Pass-2 fields
     "cloud_stack", "legacy_debt", "strategic_priorities_2026",
@@ -232,11 +254,26 @@ async def _call_with_retry(
                 return _safe_json(response.text or "")
             except ClientError as exc:
                 if exc.code == 429:
-                    jitter = random.uniform(0, delay)
-                    wait_after = min(delay + jitter, RETRY_MAX_DELAY)
+                    # Honour the Retry-After header when the API provides one;
+                    # it's more accurate than our local exponential back-off guess.
+                    retry_after_hdr: str | None = None
+                    if exc.response is not None and isinstance(
+                        exc.response, httpx.Response
+                    ):
+                        retry_after_hdr = exc.response.headers.get("retry-after")
+                    if retry_after_hdr is not None:
+                        try:
+                            wait_after = min(float(retry_after_hdr), RETRY_MAX_DELAY)
+                        except ValueError:
+                            jitter = random.uniform(0, delay)
+                            wait_after = min(delay + jitter, RETRY_MAX_DELAY)
+                    else:
+                        jitter = random.uniform(0, delay)
+                        wait_after = min(delay + jitter, RETRY_MAX_DELAY)
                     logging.warning(
-                        "[%s] Rate-limited (attempt %d/%d). Waiting %.1fs …",
+                        "[%s] Rate-limited (attempt %d/%d). Waiting %.1fs …%s",
                         label, attempt, MAX_RETRIES, wait_after,
+                        " (from Retry-After header)" if retry_after_hdr else "",
                     )
                     delay = min(delay * RETRY_EXP_BASE, RETRY_MAX_DELAY)
                 else:
@@ -280,20 +317,35 @@ async def _pass1_firmographics(
     aio_client,
     name: str,
     url: str,
-    semaphore: asyncio.Semaphore,
+    flash_semaphore: asyncio.Semaphore,
     label: str,
 ) -> dict[str, Any] | None:
     """Call 1 – Flash model: extract fast, verifiable firmographics."""
     prompt = (
         f"You are a meticulous data researcher.\n"
-        f"Company: {name}\n"
-        f"Provided URL: {url}\n\n"
-        f"Task: Extract ONLY verifiable facts from public sources for the fields below.\n"
-        f"CRITICAL RULES:\n"
-        f"  - If a value cannot be verified from a reliable public source, return exactly "
-        f"'NOT FOUND' — do NOT estimate or guess.\n"
-        f"  - Do NOT invent headcount, revenue, or location data.\n"
-        f"  - Use the most recent publicly available data (prefer 2024–2026).\n"
+        f"Company: {name!r}\n"
+        f"Provided URL: {url!r}\n\n"
+        f"STEP 1 – WEBSITE VALIDATION (do this first):\n"
+        f"  Determine whether the Provided URL is the real, official website for '{name}'.\n"
+        f"  • If the URL is valid and belongs to this company:\n"
+        f"      – Set 'website' to the provided URL.\n"
+        f"      – Set 'correct_account_name' to the original account name (unchanged).\n"
+        f"  • If the URL is invalid, incorrect, or belongs to a different entity:\n"
+        f"      – Set 'website' to the correct verified official URL.\n"
+        f"      – Set 'correct_account_name' to the correct official company name.\n"
+        f"  • If you cannot verify any website for this company: set both 'website' and\n"
+        f"    'correct_account_name' to 'NOT FOUND'.\n\n"
+        f"STEP 2 – FIRMOGRAPHIC DATA:\n"
+        f"  Extract ONLY verifiable facts from reliable public sources (Wikipedia, official\n"
+        f"  investor-relations pages, LinkedIn, Crunchbase, Bloomberg) for all remaining fields.\n\n"
+        f"FIELD CONSTRAINTS:\n"
+        f"  'region'  – US-headquartered companies ONLY. Choose EXACTLY one of:\n"
+        f"              'US East', 'US West', 'US North', 'US South', 'US Central'.\n"
+        f"              Return 'NOT FOUND' if the company is non-US or sub-region is unclear.\n"
+        f"  'geo'     – Choose EXACTLY one of: 'NA', 'LATAM', 'EMEA', 'APAC', 'ROW'.\n"
+        f"              This must always be populated if the company's country is known.\n"
+        f"  All other fields: return exactly 'NOT FOUND' if not verifiable — no guesses.\n"
+        f"  Use the most recent publicly available data (prefer 2024–2026).\n\n"
         f"Return ONLY valid JSON matching the required schema."
     )
 
@@ -309,7 +361,7 @@ async def _pass1_firmographics(
             ),
         )
 
-    return await _call_with_retry(factory, label, semaphore)
+    return await _call_with_retry(factory, label, flash_semaphore)
 
 
 async def _pass2_intelligence(
@@ -317,7 +369,7 @@ async def _pass2_intelligence(
     name: str,
     url: str,
     firmographics: dict[str, Any],
-    semaphore: asyncio.Semaphore,
+    pro_semaphore: asyncio.Semaphore,
     label: str,
 ) -> dict[str, Any] | None:
     """Call 2 – Pro model with Google Search: deep sales intelligence."""
@@ -356,7 +408,7 @@ async def _pass2_intelligence(
             ),
         )
 
-    return await _call_with_retry(factory, label, semaphore)
+    return await _call_with_retry(factory, label, pro_semaphore)
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +418,8 @@ async def _pass2_intelligence(
 async def enrich_row(
     aio_client,
     row: dict[str, str],
-    semaphore: asyncio.Semaphore,
+    flash_semaphore: asyncio.Semaphore,
+    pro_semaphore: asyncio.Semaphore,
     company_cache: dict[str, asyncio.Future],
 ) -> dict[str, Any]:
     """Enrich a single CSV row using the two-pass pipeline."""
@@ -396,23 +449,24 @@ async def enrich_row(
     else:
         fut = asyncio.Future()
         company_cache[cache_key] = fut
+        firm_data, intel_data = None, None
         try:
             # Pass 1 – Firmographics
             firm_data = await _pass1_firmographics(
-                aio_client, name, url, semaphore, label + "|pass1"
+                aio_client, name, url, flash_semaphore, label + "|pass1"
             )
 
-            # Pass 2 – Intelligence (only if pass-1 succeeded; use empty dict as fallback)
+            # Pass 2 – Intelligence (uses empty dict as fallback if pass-1 failed)
             intel_data = await _pass2_intelligence(
-                aio_client, name, url, firm_data or {}, semaphore, label + "|pass2"
+                aio_client, name, url, firm_data or {}, pro_semaphore, label + "|pass2"
             )
-            fut.set_result((firm_data, intel_data))
         except Exception as e:
             logging.error("[%s] Unexpected enrichment error: %s", label, e, exc_info=True)
-            firm_data, intel_data = None, None
-            # Always resolve the future so any waiting dedup tasks are unblocked.
+        finally:
+            # Guarantee the future always resolves — even on double-fault —
+            # so dedup waiters are never permanently blocked.
             if not fut.done():
-                fut.set_result((None, None))
+                fut.set_result((firm_data, intel_data))
 
     # --- Build output row ---
     enrichment_ok = bool(firm_data or intel_data)
@@ -421,11 +475,13 @@ async def enrich_row(
         "account_name": name,
         # Pass-1
         "website": (firm_data or {}).get("website") or url or "NOT FOUND",
+        "Correct_Account_Name": (firm_data or {}).get("correct_account_name") or name or "NOT FOUND",
         "headcount": (firm_data or {}).get("headcount", "NOT FOUND"),
         "annual_revenue": (firm_data or {}).get("annual_revenue", "NOT FOUND"),
         "industry": (firm_data or {}).get("industry", "NOT FOUND"),
         "hq_location": (firm_data or {}).get("hq_location", "NOT FOUND"),
-        "region_geo": (firm_data or {}).get("region_geo", "NOT FOUND"),
+        "region": (firm_data or {}).get("region", "NOT FOUND"),
+        "geo": (firm_data or {}).get("geo", "NOT FOUND"),
         "description": (firm_data or {}).get("description", "NOT FOUND"),
         "firmographics_confidence": (firm_data or {}).get("confidence", 0.0),
         # Pass-2
@@ -499,8 +555,9 @@ async def async_main() -> None:
     logging.info("Rows to enrich: %d", total)
 
     # --- Shared state ---
-    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)   # ONE global semaphore
-    company_cache: dict[str, asyncio.Future] = {}    # keyed by lowercase company name
+    flash_semaphore = asyncio.Semaphore(FLASH_CONCURRENCY)  # Pass-1 (Flash) gate
+    pro_semaphore   = asyncio.Semaphore(PRO_CONCURRENCY)    # Pass-2 (Pro)   gate
+    company_cache: dict[str, asyncio.Future] = {}           # dedup by company name
 
     # --- Vertex AI client ---
     client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
@@ -524,11 +581,15 @@ async def async_main() -> None:
         processed_so_far = 0
 
         try:
-            # Start initial batch (queue size slightly larger than concurrency to keep workers busy)
-            for _ in range(MAX_CONCURRENCY * 2):
+            # Pre-fill the pending queue to keep the pipeline saturated.
+            # INITIAL_QUEUE_DEPTH >> FLASH_CONCURRENCY ensures Flash never idles
+            # while waiting for new tasks to be spawned.
+            for _ in range(INITIAL_QUEUE_DEPTH):
                 try:
                     row = next(row_iter)
-                    task = asyncio.create_task(enrich_row(client.aio, row, semaphore, company_cache))
+                    task = asyncio.create_task(
+                        enrich_row(client.aio, row, flash_semaphore, pro_semaphore, company_cache)
+                    )
                     pending.add(task)
                 except StopIteration:
                     break
@@ -553,7 +614,9 @@ async def async_main() -> None:
                     # Top up the worker pool
                     try:
                         row = next(row_iter)
-                        new_task = asyncio.create_task(enrich_row(client.aio, row, semaphore, company_cache))
+                        new_task = asyncio.create_task(
+                            enrich_row(client.aio, row, flash_semaphore, pro_semaphore, company_cache)
+                        )
                         pending.add(new_task)
                     except StopIteration:
                         pass
