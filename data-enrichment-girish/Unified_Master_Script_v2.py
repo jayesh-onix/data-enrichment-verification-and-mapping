@@ -54,7 +54,7 @@ LOCATION = "global"                   # Vertex AI location
 MODEL_NAME = "gemini-3.1-pro-preview"
 
 INPUT_FILE = Path("data/test_final_10.csv")
-OUTPUT_REPORT = Path("data/test_final_10_output_v11.csv")
+OUTPUT_REPORT = Path("data/test_final_10_output_v13.csv")
 
 # Concurrency – one global semaphore (tune to your GCP project’s Pro QPM quota)
 MAX_CONCURRENCY = 30
@@ -99,75 +99,89 @@ class AccountEnrichment(BaseModel):
     headcount: str = Field(
         description=(
             "Current employee count range (e.g. '5,000–10,000'). "
-            "Return 'NOT FOUND' if not verifiable from public sources."
+            "Never return 'NOT FOUND'. If exact figures are unavailable, provide a "
+            "reasonable estimate range based on company type, industry, and available signals "
+            "(e.g., '500-1000')."
         )
     )
     annual_revenue: str = Field(
         description=(
             "Latest annual revenue (e.g. '$2.5B'). "
-            "Return 'NOT FOUND' if not publicly disclosed."
+            "Never return 'NOT FOUND'. If not publicly disclosed, provide a best estimate "
+            "based on company size and industry (e.g., '$500M–$1B')."
         )
     )
     industry: str = Field(
         description=(
-            "Primary industry classification (e.g. 'Financial Services'). "
-            "Return 'NOT FOUND' if unclear."
+            "Primary industry classification (e.g. 'Financial Services', 'Healthcare', "
+            "'Technology', 'Manufacturing'). Always classify based on company context. "
+            "Never return 'NOT FOUND'."
         )
     )
     hq_location: str = Field(
         description=(
-            "HQ City, State, Country (e.g. 'Austin, TX, USA'). "
-            "Return 'NOT FOUND' if not verifiable."
+            "HQ Country only (e.g. 'USA', 'United Kingdom', 'Germany', 'India'). "
+            "Return ONLY the country name — no city, no state. "
+            "Always populate based on available information. Never return 'NOT FOUND'."
         )
     )
     region: str = Field(
         description=(
-            "US Region. Use ONLY: 'US East', 'US West', 'US North', 'US South', or 'US Central'. "
-            "Return 'NOT FOUND' if the company is non-US or sub-region is unclear."
+            "US Region. "
+            "Use EXACTLY one of: 'US East', 'US West', 'US North', 'US South', 'US Central'. "
+            "Never return 'NOT FOUND' or 'N/A'. If the company is non-US or the sub-region is ambiguous, "
+            "choose the closest match based on HQ city/state."
         )
     )
     geo: str = Field(
         description=(
-            "Global Geography. Use ONLY: 'NA', 'LATAM', 'EMEA', 'APAC', or 'ROW'. "
-            "Return 'NOT FOUND' if unverifiable."
+            "Global Geography. Use EXACTLY one of: 'NA', 'LATAM', 'EMEA', 'APAC', 'ROW'. "
+            "Always populate based on the company's country. Never return 'NOT FOUND'."
         )
     )
     description: str = Field(
         description=(
             "Brief Wikipedia-style overview (2–3 sentences) of the organisation. "
-            "Return 'NOT FOUND' if no reliable information exists."
+            "Always provide based on available correct information. Never return 'NOT FOUND'."
         )
     )
     # Sales intelligence
     cloud_stack: str = Field(
         description=(
             "Current cloud usage (AWS / Azure / GCP) and Workspace or M365 footprint. "
-            "Return 'NOT FOUND' if not verifiable."
+            "Never return 'NOT FOUND'. If specific providers are unconfirmed, state a "
+            "reasonable inference based on company profile, industry trends, and available signals."
         )
     )
     legacy_debt: str = Field(
         description=(
-            "Legacy tech displacement targets (e.g. Snowflake, Teradata, Oracle, "
-            "Hadoop, on-prem DCs). Return 'NOT FOUND' if unknown."
+            "Legacy tech targets (e.g. Snowflake, Teradata, Oracle, "
+            "Hadoop, on-prem DCs). Never return 'NOT FOUND'. if specific technologies are unconfirmed,"
+            "provide a best-effort assessment based on company size, industry, and context and provide" 
+            "suitable legacy tech information."
         )
     )
     strategic_priorities_2026: str = Field(
         description=(
             "Top 3 board-level priorities or investment areas for 2026. "
-            "Return 'NOT FOUND' if no reliable signals exist."
+            "Never return 'NOT FOUND'. If no specific public signals exist, infer "
+            "from company type, industry trends, and size (e.g., AI adoption, cost "
+            "optimisation, digital transformation)."
         )
     )
     business_triggers: str = Field(
         description=(
-            "Recent M&A, DC exits, or leadership changes impacting IT. "
-            "Return 'NOT FOUND' if no recent events found."
+            "Recent M&A, DC exits, leadership changes, or strategic announcements "
+            "impacting IT (2024–2026). Never return 'NOT FOUND'. If no specific signals, infer likely" 
+            "triggers based on company context and industry trends."
         )
     )
     sales_hook_2026: str = Field(
         description=(
             "The 'Why Now?' — the best, specific reason for a Google AE to reach out "
-            "today in 2026. Must be grounded in real signals. "
-            "Return 'NOT FOUND' if no strong hook is identified."
+            "today in 2026. Always provide a concrete hook grounded in real or inferred "
+            "signals (company triggers, industry shifts, AI trends, cost pressures). "
+            "Never return 'NOT FOUND'."
         )
     )
     sources: str = Field(
@@ -219,6 +233,54 @@ def _safe_json(raw: str) -> dict[str, Any] | None:
         return None
 
 
+def _extract_response_data(response) -> dict[str, Any] | None:
+    """Extract structured data from a Gemini API response.
+
+    Tries `response.parsed` first (SDK-validated Pydantic object — most
+    reliable, already type-checked by the server).  Falls back to parsing
+    `response.text` as JSON so we still recover data even if the SDK's
+    structured parser trips on a minor schema deviation.
+    """
+    parsed = getattr(response, "parsed", None)
+    if parsed is not None:
+        try:
+            if hasattr(parsed, "model_dump"):
+                return parsed.model_dump()
+            return dict(parsed)
+        except Exception as exc:
+            logging.warning("response.parsed serialisation failed: %s", exc)
+
+    return _safe_json(response.text or "")
+
+
+def _normalize_country(value: str) -> str:
+    """Return country-only from a potentially city/state/country string.
+
+    'Austin, TX, USA'  → 'USA'
+    'USA'              → 'USA'
+    ''                 → ''
+    """
+    if not value:
+        return value
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    return parts[-1] if parts else value.strip()
+
+
+def _normalize_sources(value: Any) -> str:
+    """Coerce sources to a string; join list values with '; '."""
+    if isinstance(value, list):
+        return "; ".join(str(v) for v in value if v)
+    return str(value) if value else "NOT FOUND"
+
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    """Safely coerce any value to float."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 async def _call_with_retry(
     coro_factory,
     label: str,
@@ -241,7 +303,7 @@ async def _call_with_retry(
                 response = await asyncio.wait_for(
                     coro_factory(), timeout=API_TIMEOUT_S
                 )
-                return _safe_json(response.text or "")
+                return _extract_response_data(response)
             except ClientError as exc:
                 if exc.code in (429, 499):
                     # 429 = rate-limited; 499 = the server or our asyncio.wait_for
@@ -332,20 +394,31 @@ async def _enrich_account(
         f"    company name.\n"
         f"  • If unverifiable: set both to 'NOT FOUND'.\n\n"
         f"STEP 2 – FIRMOGRAPHIC DATA:\n"
-        f"  Extract verifiable facts from public sources (Wikipedia, official IR pages,\n"
-        f"  LinkedIn, Crunchbase, Bloomberg). Use the most recent data (prefer 2024–2026).\n\n"
+        f"  Extract facts from public sources (Wikipedia, official IR pages, LinkedIn,\n"
+        f"  Crunchbase, Bloomberg). Use the most recent data (prefer 2024–2026).\n"
+        f"  If specific data is not publicly available, provide a reasonable best-effort\n"
+        f"  estimate based on company type, size, and industry context.\n\n"
         f"STEP 3 – SALES INTELLIGENCE:\n"
         f"  Research the CURRENT tech stack, strategic priorities, business triggers,\n"
-        f"  and create a specific sales hook for a Google Cloud AE in 2026.\n\n"
-        f"FIELD CONSTRAINTS:\n"
-        f"  'region'  – US-headquartered companies ONLY. Choose EXACTLY one of:\n"
+        f"  and create a specific sales hook for a Google Cloud AE in 2026.\n"
+        f"  Always produce substantive output — use inferences from company profile and\n"
+        f"  industry trends when specific public signals are limited.\n\n"
+        f"FIELD CONSTRAINTS (CRITICAL — follow exactly):\n"
+        f"  'hq_location' – Return ONLY the country name (e.g. 'USA', 'United Kingdom',\n"
+        f"                  'Germany'). No city, no state. Always populate.\n"
+        f"  'region'  – For US-headquartered companies, choose EXACTLY one of:\n"
         f"              'US East', 'US West', 'US North', 'US South', 'US Central'.\n"
-        f"              Return 'NOT FOUND' if non-US or sub-region is unclear.\n"
+        f"              If the company is non-US or the sub-region is ambiguous,\n"
+        f"              choose the closest match based on HQ city/state.\n"
         f"  'geo'     – Choose EXACTLY one of: 'NA', 'LATAM', 'EMEA', 'APAC', 'ROW'.\n"
-        f"              Must always be populated if the company's country is known.\n"
-        f"  All other fields: return exactly 'NOT FOUND' if not verifiable — no guesses.\n"
-        f"  Include source URLs in the 'sources' field.\n"
-        f"  The sales_hook_2026 must be grounded in a specific, real signal — not generic.\n\n"
+        f"              Always populate based on the company's country. NEVER return 'NOT FOUND'.\n"
+        f"  'website' and 'correct_account_name' – Use 'NOT FOUND' ONLY if truly unverifiable.\n"
+        f"  All firmographic + sales intelligence fields (headcount, annual_revenue,\n"
+        f"  industry, description, cloud_stack, legacy_debt, strategic_priorities_2026,\n"
+        f"  business_triggers, sales_hook_2026) – NEVER return 'NOT FOUND'. Provide best\n"
+        f"  available estimates, reasonable inferences, or concise statements based on\n"
+        f"  company context. A specific sales_hook_2026 is mandatory in all cases.\n"
+        f"  Include source URLs in the 'sources' field.\n\n"
         f"Return ONLY valid JSON matching the required schema."
     )
 
@@ -415,25 +488,28 @@ async def enrich_row(
     return {
         "account_id": account_id,
         "account_name": name,
-        # Website validation
+        # Website validation (NOT FOUND allowed here)
         "website": d.get("website") or url or "NOT FOUND",
         "Correct_Account_Name": d.get("correct_account_name") or name or "NOT FOUND",
-        # Firmographics
-        "headcount": d.get("headcount", "NOT FOUND"),
-        "annual_revenue": d.get("annual_revenue", "NOT FOUND"),
-        "industry": d.get("industry", "NOT FOUND"),
-        "hq_location": d.get("hq_location", "NOT FOUND"),
-        "region": d.get("region", "NOT FOUND"),
-        "geo": d.get("geo", "NOT FOUND"),
-        "description": d.get("description", "NOT FOUND"),
-        # Sales intelligence
-        "cloud_stack": d.get("cloud_stack", "NOT FOUND"),
-        "legacy_debt": d.get("legacy_debt", "NOT FOUND"),
-        "strategic_priorities_2026": d.get("strategic_priorities_2026", "NOT FOUND"),
-        "business_triggers": d.get("business_triggers", "NOT FOUND"),
-        "sales_hook_2026": d.get("sales_hook_2026", "NOT FOUND"),
-        "sources": d.get("sources", "NOT FOUND"),
-        "confidence": d.get("confidence", 0.0),
+        # Firmographics (NOT FOUND must not appear — fall back to empty string on API failure)
+        "headcount": d.get("headcount") or "",
+        "annual_revenue": d.get("annual_revenue") or "",
+        "industry": d.get("industry") or "",
+        # Normalize country: strip city/state if model returns e.g. "Austin, TX, USA"
+        "hq_location": _normalize_country(d.get("hq_location") or ""),
+        "region": d.get("region") or "",
+        "geo": d.get("geo") or "",
+        "description": d.get("description") or "",
+        # Sales intelligence (NOT FOUND must not appear)
+        "cloud_stack": d.get("cloud_stack") or "",
+        "legacy_debt": d.get("legacy_debt") or "",
+        "strategic_priorities_2026": d.get("strategic_priorities_2026") or "",
+        "business_triggers": d.get("business_triggers") or "",
+        "sales_hook_2026": d.get("sales_hook_2026") or "",
+        # Sources: coerce list → joined string (model may return list despite str schema)
+        "sources": _normalize_sources(d.get("sources")),
+        # Confidence: coerce to float (model may return string "0.8")
+        "confidence": _coerce_float(d.get("confidence", 0.0)),
         # Metadata
         "enrichment_status": "success" if data else "failed",
         "enriched_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
@@ -542,11 +618,18 @@ async def async_main() -> None:
                 for task in done:
                     try:
                         result = task.result()
-                        writer.writerow(result)
                         if result.get("enrichment_status") == "success":
+                            writer.writerow(result)
                             completed += 1
                         else:
+                            # Do NOT write failed rows — resume logic re-tries them on
+                            # next run.  Writing them now would create duplicate rows
+                            # (one failed, one later successful) in the output file.
                             failed += 1
+                            logging.warning(
+                                "Enrichment FAILED for '%s' (account_id=%s) — will retry on next run.",
+                                result.get("account_name", "?"), result.get("account_id", "?"),
+                            )
                     except Exception as e:
                         logging.error("Unexpected task exception: %s", e, exc_info=e)
                         failed += 1
