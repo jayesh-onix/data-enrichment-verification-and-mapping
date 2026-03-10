@@ -1,27 +1,34 @@
 """
 Unified Master Enrichment & Intelligence Script v2
-Production-Ready | 40k+ Rows | Single-Pass Pipeline
+Production-Ready | 40k+ Rows | Single-Pass Pro Pipeline
 
 Architecture:
   Single API call per company using gemini-3.1-pro-preview with
   Google Search grounding + controlled generation (response_schema).
+  This proven combination delivers the best accuracy.
 
-  Why single-pass?
-    • gemini-2.5-flash does NOT support response_schema + Google Search
-      together on Vertex AI (returns 400 INVALID_ARGUMENT).
-    • A two-pass Flash (no search) + Pro approach causes two problems:
-        1. Pass-1 validates website / firmographics WITHOUT real search — unreliable.
-        2. Pass-1’s unverified output biases Pass-2 when passed as “known context”.
-    • A single Pro + Search call grounds EVERY field in real web data,
-      eliminates the bias chain, and halves the total API calls (40k vs 80k).
+  NOTE: gemini-2.5-flash does NOT support response_schema + Google Search
+  together on Vertex AI (returns 400 INVALID_ARGUMENT). A two-pass
+  Flash + Pro pipeline was tested and produced worse results than a
+  single holistic Pro call. The single-pass approach is both faster
+  (fewer API calls) and more accurate.
 
-  Operational features:
-    • Global semaphore for quota-safe concurrency
-    • Retry with exponential back-off + Retry-After header for 429 / 499 / 5xx
+Improvements over base:
+  Phase 1 – Critical Bug Fixes
+    • Global semaphore (one shared instance, not per-task)
+    • Retry queue with exponential back-off for 429 / transient errors
+    • Header written reliably (empty-file check before writing)
+
+  Phase 2 – Data Accuracy
+    • "NOT FOUND" enforcement for unverifiable facts (headcount, revenue)
+    • Robust JSON parsing – strips markdown fences, catches JSONDecodeError
+    • Search grounding + controlled generation for reliable structured output
+
+  Phase 3 – Performance
+    • MAX_CONCURRENCY raised to 30 (tune to your quota)
+    • Static batch sleep removed; rate-limit back-off via retry queue
     • In-memory company cache to skip duplicate API calls
-    • Resume support: skips already-enriched rows on restart
-    • Per-call asyncio timeout (180 s) to accommodate long search-grounded calls
-    • Streaming CSV writes with flush after each batch
+    • Per-call asyncio timeout (120 s) to prevent hung tasks
 """
 
 from __future__ import annotations
@@ -37,7 +44,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
 from google import genai
 from google.genai import types
 from google.genai.errors import ClientError, ServerError
@@ -50,17 +56,14 @@ from pydantic import BaseModel, Field
 PROJECT_ID = "search-ahmed"       # GCP project
 LOCATION = "global"                   # Vertex AI location
 
-# Single model: Pro with Google Search + controlled generation
+# Model: Pro with Google Search + controlled generation (proven best quality)
 MODEL_NAME = "gemini-3.1-pro-preview"
 
 INPUT_FILE = Path("data/test_final_10.csv")
-OUTPUT_REPORT = Path("data/test_final_10_output_v11.csv")
+OUTPUT_REPORT = Path("data/test_final_10_output_v4.csv")
 
-# Concurrency – one global semaphore (tune to your GCP project’s Pro QPM quota)
+# Concurrency – one global semaphore shared by ALL tasks
 MAX_CONCURRENCY = 30
-
-# How many asyncio tasks to pre-spawn into the pending queue.
-INITIAL_QUEUE_DEPTH = MAX_CONCURRENCY * 2
 
 # Retry settings for 429 / 5xx errors
 MAX_RETRIES = 5
@@ -69,113 +72,31 @@ RETRY_MAX_DELAY = 120.0      # seconds
 RETRY_EXP_BASE = 2.0
 
 # Per-call API timeout
-# Pro + Google Search with AFC can legitimately take 60–90s for complex
-# companies (multiple search rounds).  Set generous timeouts so the client
-# does NOT cancel in-flight requests (which causes 499 CANCELLED errors).
-API_TIMEOUT_S  = 180.0       # asyncio.wait_for timeout (seconds)
-API_TIMEOUT_MS = 170_000     # httpx-layer fallback timeout (milliseconds, slightly less)
+API_TIMEOUT_S  = 120.0       # asyncio.wait_for timeout (seconds)
+API_TIMEOUT_MS = 110_000     # httpx-layer fallback timeout (milliseconds, slightly less than above)
 
 # ---------------------------------------------------------------------------
-# OUTPUT SCHEMA – Unified Pydantic model for structured response
+# OUTPUT SCHEMA – Pydantic model for structured response
 # ---------------------------------------------------------------------------
 
-class AccountEnrichment(BaseModel):
-    """Unified schema: website validation + firmographics + sales intelligence."""
-    # Website validation & account name
-    website: str = Field(
-        description=(
-            "Verified official website URL for this company. "
-            "Return 'NOT FOUND' if unverifiable."
-        )
-    )
-    correct_account_name: str = Field(
-        description=(
-            "The correct official company name as found on the verified website. "
-            "If the provided website was invalid, write the correct company name. "
-            "If valid, keep the original account name unchanged."
-        )
-    )
+class AccountIntelligence(BaseModel):
+    """Unified Schema: Basic Firmographics + Deep Sales Intelligence."""
     # Firmographics
-    headcount: str = Field(
-        description=(
-            "Current employee count range (e.g. '5,000–10,000'). "
-            "Return 'NOT FOUND' if not verifiable from public sources."
-        )
-    )
-    annual_revenue: str = Field(
-        description=(
-            "Latest annual revenue (e.g. '$2.5B'). "
-            "Return 'NOT FOUND' if not publicly disclosed."
-        )
-    )
-    industry: str = Field(
-        description=(
-            "Primary industry classification (e.g. 'Financial Services'). "
-            "Return 'NOT FOUND' if unclear."
-        )
-    )
-    hq_location: str = Field(
-        description=(
-            "HQ City, State, Country (e.g. 'Austin, TX, USA'). "
-            "Return 'NOT FOUND' if not verifiable."
-        )
-    )
-    region: str = Field(
-        description=(
-            "US Region. Use ONLY: 'US East', 'US West', 'US North', 'US South', or 'US Central'. "
-            "Return 'NOT FOUND' if the company is non-US or sub-region is unclear."
-        )
-    )
-    geo: str = Field(
-        description=(
-            "Global Geography. Use ONLY: 'NA', 'LATAM', 'EMEA', 'APAC', or 'ROW'. "
-            "Return 'NOT FOUND' if unverifiable."
-        )
-    )
-    description: str = Field(
-        description=(
-            "Brief Wikipedia-style overview (2–3 sentences) of the organisation. "
-            "Return 'NOT FOUND' if no reliable information exists."
-        )
-    )
-    # Sales intelligence
-    cloud_stack: str = Field(
-        description=(
-            "Current cloud usage (AWS / Azure / GCP) and Workspace or M365 footprint. "
-            "Return 'NOT FOUND' if not verifiable."
-        )
-    )
-    legacy_debt: str = Field(
-        description=(
-            "Legacy tech displacement targets (e.g. Snowflake, Teradata, Oracle, "
-            "Hadoop, on-prem DCs). Return 'NOT FOUND' if unknown."
-        )
-    )
-    strategic_priorities_2026: str = Field(
-        description=(
-            "Top 3 board-level priorities or investment areas for 2026. "
-            "Return 'NOT FOUND' if no reliable signals exist."
-        )
-    )
-    business_triggers: str = Field(
-        description=(
-            "Recent M&A, DC exits, or leadership changes impacting IT. "
-            "Return 'NOT FOUND' if no recent events found."
-        )
-    )
-    sales_hook_2026: str = Field(
-        description=(
-            "The 'Why Now?' — the best, specific reason for a Google AE to reach out "
-            "today in 2026. Must be grounded in real signals. "
-            "Return 'NOT FOUND' if no strong hook is identified."
-        )
-    )
-    sources: str = Field(
-        description="Key URLs used for verification (LinkedIn, Wikipedia, news articles)."
-    )
-    confidence: float = Field(
-        description="Overall confidence in the enrichment data (0.0 to 1.0)."
-    )
+    headcount: str = Field(description="Current employee count range")
+    annual_revenue: str = Field(description="Latest annual revenue (e.g. $2.5B)")
+    industry: str = Field(description="Primary industry classification")
+    hq_location: str = Field(description="HQ City, State, and Country")
+    region_geo: str = Field(description="US Region (East/West/etc) and Global GEO (NA/EMEA/etc)")
+    description: str = Field(description="Brief Wikipedia-style overview of the organization")
+    website: str = Field(description="Verified official URL")
+    # Sales Intelligence
+    cloud_stack: str = Field(description="Current Cloud usage (AWS, Azure, GCP) and Workspace/M365 footprint")
+    legacy_debt: str = Field(description="Legacy tech targets (e.g., Snowflake, Teradata, Oracle, Hadoop, On-prem DCs)")
+    strategic_priorities_2026: str = Field(description="Top 3 board-level priorities or investment areas for 2026")
+    business_triggers: str = Field(description="Recent M&A, DC exits, or leadership changes impacting IT")
+    sales_hook_2026: str = Field(description="The 'Why Now?'—the best reason for a Google AE to reach out today")
+    sources: str = Field(description="Key links used for verification (LinkedIn, Wikipedia, News)")
+    confidence: float = Field(description="Confidence score (0.0 to 1.0)")
 
 
 # ---------------------------------------------------------------------------
@@ -184,12 +105,10 @@ class AccountEnrichment(BaseModel):
 
 FIELDNAMES = [
     "account_id", "account_name",
-    # Website validation
-    "website", "Correct_Account_Name",
     # Firmographics
-    "headcount", "annual_revenue", "industry",
-    "hq_location", "region", "geo", "description",
-    # Sales intelligence
+    "website", "headcount", "annual_revenue", "industry",
+    "hq_location", "region_geo", "description",
+    # Sales Intelligence
     "cloud_stack", "legacy_debt", "strategic_priorities_2026",
     "business_triggers", "sales_hook_2026",
     "sources", "confidence",
@@ -226,46 +145,35 @@ async def _call_with_retry(
 ) -> dict[str, Any] | None:
     """
     Execute `coro_factory()` under the global semaphore.
-    Retries on 429, 499, 5xx, and transient timeout errors with
+    Retries on 429 (rate limit) and 5xx (transient server errors) with
     exponential back-off + full jitter.  Returns None after all attempts fail.
 
     Key design: the semaphore is RELEASED before any sleep so that other
     tasks are not starved while this one waits out a rate-limit or backoff.
+    asyncio.wait_for() is used to guarantee a real asyncio.TimeoutError is
+    raised (httpx timeouts raise httpx exceptions, not asyncio.TimeoutError).
     """
     delay = RETRY_INITIAL_DELAY
     for attempt in range(1, MAX_RETRIES + 1):
+        # wait_after is set to a positive number only when we should retry.
+        # It is checked OUTSIDE the semaphore so the slot is not held during sleep.
         wait_after: float | None = None
 
         async with semaphore:
             try:
+                # asyncio.wait_for raises asyncio.TimeoutError on expiry,
+                # regardless of what the underlying httpx client would raise.
                 response = await asyncio.wait_for(
                     coro_factory(), timeout=API_TIMEOUT_S
                 )
                 return _safe_json(response.text or "")
             except ClientError as exc:
-                if exc.code in (429, 499):
-                    # 429 = rate-limited; 499 = the server or our asyncio.wait_for
-                    # cancelled the request (Client Closed Request).  Both are transient.
-                    retry_after_hdr: str | None = None
-                    if exc.code == 429 and exc.response is not None and isinstance(
-                        exc.response, httpx.Response
-                    ):
-                        retry_after_hdr = exc.response.headers.get("retry-after")
-                    if retry_after_hdr is not None:
-                        try:
-                            wait_after = min(float(retry_after_hdr), RETRY_MAX_DELAY)
-                        except ValueError:
-                            jitter = random.uniform(0, delay)
-                            wait_after = min(delay + jitter, RETRY_MAX_DELAY)
-                    else:
-                        jitter = random.uniform(0, delay)
-                        wait_after = min(delay + jitter, RETRY_MAX_DELAY)
+                if exc.code == 429:
+                    jitter = random.uniform(0, delay)
+                    wait_after = min(delay + jitter, RETRY_MAX_DELAY)
                     logging.warning(
-                        "[%s] %s (attempt %d/%d). Waiting %.1fs …%s",
-                        label,
-                        "Rate-limited" if exc.code == 429 else "Request cancelled (499)",
-                        attempt, MAX_RETRIES, wait_after,
-                        " (from Retry-After header)" if retry_after_hdr else "",
+                        "[%s] Rate-limited (attempt %d/%d). Waiting %.1fs …",
+                        label, attempt, MAX_RETRIES, wait_after,
                     )
                     delay = min(delay * RETRY_EXP_BASE, RETRY_MAX_DELAY)
                 else:
@@ -279,18 +187,18 @@ async def _call_with_retry(
                     label, exc.code, attempt, MAX_RETRIES, wait_after,
                 )
                 delay = min(delay * RETRY_EXP_BASE, RETRY_MAX_DELAY)
-            except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+            except asyncio.TimeoutError:
                 wait_after = min(delay, RETRY_MAX_DELAY)
-                logging.warning(
-                    "[%s] Timeout (%s, attempt %d/%d). Waiting %.1fs …",
-                    label, type(exc).__name__, attempt, MAX_RETRIES, wait_after,
+                logging.error(
+                    "[%s] API call timed out (attempt %d/%d). Waiting %.1fs …",
+                    label, attempt, MAX_RETRIES, wait_after,
                 )
                 delay = min(delay * RETRY_EXP_BASE, RETRY_MAX_DELAY)
             except Exception as exc:
                 logging.error("[%s] Unexpected error: %s", label, exc, exc_info=True)
                 return None
 
-        # Semaphore released — sleep without blocking other tasks.
+        # Semaphore released — now safe to sleep without blocking other tasks.
         if wait_after is not None:
             await asyncio.sleep(wait_after)
 
@@ -314,39 +222,18 @@ async def _enrich_account(
 ) -> dict[str, Any] | None:
     """Single Pro call with Google Search + controlled generation.
 
-    A holistic prompt lets the model research everything in one search session.
-    Website validation, firmographics, and sales intelligence are all
-    grounded in real web data — no blind guesses.
+    This combination (Pro + search + response_schema) is proven to deliver
+    the best accuracy.  A holistic prompt lets the model research everything
+    in one search session, producing more complete data than split calls.
     """
     prompt = (
-        f"You are a Senior Sales Intelligence Analyst for Google Cloud.\n"
-        f"Company: {name!r}\n"
-        f"Provided URL: {url!r}\n\n"
-        f"STEP 1 – WEBSITE VALIDATION (do this first):\n"
-        f"  Use Google Search to determine whether the Provided URL is the real,\n"
-        f"  official website for '{name}'.\n"
-        f"  • If valid: set 'website' to the provided URL, set 'correct_account_name'\n"
-        f"    to the original account name (unchanged).\n"
-        f"  • If invalid or belongs to a different entity: set 'website' to the correct\n"
-        f"    verified official URL, set 'correct_account_name' to the correct official\n"
-        f"    company name.\n"
-        f"  • If unverifiable: set both to 'NOT FOUND'.\n\n"
-        f"STEP 2 – FIRMOGRAPHIC DATA:\n"
-        f"  Extract verifiable facts from public sources (Wikipedia, official IR pages,\n"
-        f"  LinkedIn, Crunchbase, Bloomberg). Use the most recent data (prefer 2024–2026).\n\n"
-        f"STEP 3 – SALES INTELLIGENCE:\n"
-        f"  Research the CURRENT tech stack, strategic priorities, business triggers,\n"
-        f"  and create a specific sales hook for a Google Cloud AE in 2026.\n\n"
-        f"FIELD CONSTRAINTS:\n"
-        f"  'region'  – US-headquartered companies ONLY. Choose EXACTLY one of:\n"
-        f"              'US East', 'US West', 'US North', 'US South', 'US Central'.\n"
-        f"              Return 'NOT FOUND' if non-US or sub-region is unclear.\n"
-        f"  'geo'     – Choose EXACTLY one of: 'NA', 'LATAM', 'EMEA', 'APAC', 'ROW'.\n"
-        f"              Must always be populated if the company's country is known.\n"
-        f"  All other fields: return exactly 'NOT FOUND' if not verifiable — no guesses.\n"
-        f"  Include source URLs in the 'sources' field.\n"
-        f"  The sales_hook_2026 must be grounded in a specific, real signal — not generic.\n\n"
-        f"Return ONLY valid JSON matching the required schema."
+        f"Act as a Senior Sales Intelligence Analyst for Google Cloud. "
+        f"Research {name} (URL: {url}) to provide a full 360-degree view for 2026 planning.\n\n"
+        f"1. EXTRACT BASIC DATA: Headcount, Revenue, Industry, and detailed HQ/Region/GEO.\n"
+        f"2. ANALYZE TECH STACK: Identify Cloud providers and legacy 'displacement' targets (Snowflake, Teradata, etc).\n"
+        f"3. FORECAST 2026: Identify board-level priorities and specific AI/Data mandates.\n"
+        f"4. CREATE THE HOOK: Based on your research, write a specific sales 'hook' for an AE.\n\n"
+        f"Use Google Search to find the most recent 2025/2026 signals. Return ONLY valid JSON."
     )
 
     def factory():
@@ -357,7 +244,7 @@ async def _enrich_account(
                 http_options=_HTTP_OPTIONS,
                 tools=[types.Tool(google_search=types.GoogleSearch())],
                 response_mime_type="application/json",
-                response_schema=AccountEnrichment,
+                response_schema=AccountIntelligence,
                 temperature=0,
             ),
         )
@@ -375,7 +262,7 @@ async def enrich_row(
     semaphore: asyncio.Semaphore,
     company_cache: dict[str, asyncio.Future],
 ) -> dict[str, Any]:
-    """Enrich a single CSV row using a single Pro + Search API call."""
+    """Enrich a single CSV row using a single Pro API call."""
     account_id = row.get("account_id", "")
     name = row.get("account_name", "").strip()
     url = row.get("website", "").strip()
@@ -400,33 +287,31 @@ async def enrich_row(
     else:
         fut = asyncio.Future()
         company_cache[cache_key] = fut
-        data = None
         try:
-            data = await _enrich_account(aio_client, name, url, semaphore, label)
+            data = await _enrich_account(
+                aio_client, name, url, semaphore, label
+            )
+            fut.set_result(data)
         except Exception as e:
             logging.error("[%s] Unexpected enrichment error: %s", label, e, exc_info=True)
-        finally:
-            # Guarantee the future always resolves so dedup waiters are never blocked.
+            data = None
             if not fut.done():
-                fut.set_result(data)
+                fut.set_result(None)
 
     # --- Build output row ---
     d = data or {}
     return {
         "account_id": account_id,
         "account_name": name,
-        # Website validation
-        "website": d.get("website") or url or "NOT FOUND",
-        "Correct_Account_Name": d.get("correct_account_name") or name or "NOT FOUND",
         # Firmographics
+        "website": d.get("website") or url or "NOT FOUND",
         "headcount": d.get("headcount", "NOT FOUND"),
         "annual_revenue": d.get("annual_revenue", "NOT FOUND"),
         "industry": d.get("industry", "NOT FOUND"),
         "hq_location": d.get("hq_location", "NOT FOUND"),
-        "region": d.get("region", "NOT FOUND"),
-        "geo": d.get("geo", "NOT FOUND"),
+        "region_geo": d.get("region_geo", "NOT FOUND"),
         "description": d.get("description", "NOT FOUND"),
-        # Sales intelligence
+        # Sales Intelligence
         "cloud_stack": d.get("cloud_stack", "NOT FOUND"),
         "legacy_debt": d.get("legacy_debt", "NOT FOUND"),
         "strategic_priorities_2026": d.get("strategic_priorities_2026", "NOT FOUND"),
@@ -450,10 +335,6 @@ async def async_main() -> None:
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
-    # Suppress noisy per-request HTTP and AFC logs from the genai SDK.
-    # Our own retry/progress logging provides all needed operational visibility.
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("google.genai").setLevel(logging.WARNING)
 
     # --- Input validation ---
     if not INPUT_FILE.exists():
@@ -501,8 +382,8 @@ async def async_main() -> None:
     logging.info("Rows to enrich: %d", total)
 
     # --- Shared state ---
-    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)       # ONE global semaphore
-    company_cache: dict[str, asyncio.Future] = {}        # dedup by company name
+    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)   # ONE global semaphore
+    company_cache: dict[str, asyncio.Future] = {}    # keyed by lowercase company name
 
     # --- Vertex AI client ---
     client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
@@ -526,12 +407,11 @@ async def async_main() -> None:
         processed_so_far = 0
 
         try:
-            for _ in range(INITIAL_QUEUE_DEPTH):
+            # Start initial batch (queue size slightly larger than concurrency to keep workers busy)
+            for _ in range(MAX_CONCURRENCY * 2):
                 try:
                     row = next(row_iter)
-                    task = asyncio.create_task(
-                        enrich_row(client.aio, row, semaphore, company_cache)
-                    )
+                    task = asyncio.create_task(enrich_row(client.aio, row, semaphore, company_cache))
                     pending.add(task)
                 except StopIteration:
                     break
@@ -556,9 +436,7 @@ async def async_main() -> None:
                     # Top up the worker pool
                     try:
                         row = next(row_iter)
-                        new_task = asyncio.create_task(
-                            enrich_row(client.aio, row, semaphore, company_cache)
-                        )
+                        new_task = asyncio.create_task(enrich_row(client.aio, row, semaphore, company_cache))
                         pending.add(new_task)
                     except StopIteration:
                         pass
